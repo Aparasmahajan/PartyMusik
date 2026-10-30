@@ -1,0 +1,85 @@
+# PR pipeline from docs/14 §4: shared tests, Android debug build, iOS simulator build.
+# The Android and iOS jobs are the first compile of that code (doc 15 §1), so expect fixes on the first run.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.jvmargs="-Xmx4g -Dfile.encoding=UTF-8"
+
+jobs:
+  shared:
+    name: Shared core (JVM tests) + desktop UI
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - run: chmod +x gradlew
+      # Android off here so this job stays fast and independent of the SDK image.
+      - run: ./gradlew -Ppartymusik.android=false :shared:jvmTest :composeApp:compileKotlinDesktop
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jvm-test-reports
+          path: shared/build/reports/tests/jvmTest
+
+  android:
+    name: Android (debug APK + lint)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - run: chmod +x gradlew
+      # The runner image provides ANDROID_HOME with licences accepted; AGP installs platform 36 if missing.
+      - run: ./gradlew -Ppartymusik.android=true :composeApp:assembleDebug
+      - name: Lint (report only until the first device build is clean)
+        run: ./gradlew -Ppartymusik.android=true :composeApp:lintDebug
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: partymusik-debug-apk
+          path: composeApp/build/outputs/apk/debug/*.apk
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-lint-report
+          path: composeApp/build/reports/lint-results-debug.html
+
+  ios:
+    name: iOS (simulator tests + app build)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - run: chmod +x gradlew
+      - name: Shared tests on the iOS simulator + Kotlin framework
+        run: ./gradlew -Ppartymusik.android=false -Ppartymusik.ios=true :shared:iosSimulatorArm64Test :composeApp:linkDebugFrameworkIosSimulatorArm64
+      - name: Generate Xcode project
+        run: brew install xcodegen && cd iosApp && xcodegen generate
+      # Unsigned simulator build; Bluetooth routing itself can only be tested on a device (docs/14 §9).
+      - name: Build app for the simulator
+        working-directory: iosApp
+        run: >
+          xcodebuild -project PartyMusik.xcodeproj -target PartyMusik
+          -sdk iphonesimulator -configuration Debug
+          ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO build
